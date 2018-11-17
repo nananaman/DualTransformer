@@ -1,0 +1,6 @@
+__pycache__/
+data/
+log.train.log
+log.valid.log
+pred.txt
+trained.chkpt
