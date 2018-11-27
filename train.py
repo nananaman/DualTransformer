@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from nltk.translate import bleu_score
 
 import transformer.Constants as Constants
 from transformer.Models import Transformer, Discriminator
@@ -211,8 +212,8 @@ def train_epoch(model, discriminator, training_data, optimizer, optimizer_d, opt
 
         loss_auto_src, z_src_src, n_correct, n_word = auto_encoder(
             model, src_seq, src_pos, smoothing)
-        n_word_total += n_word
-        n_word_correct += n_correct
+        # n_word_total += n_word
+        # n_word_correct += n_correct
 
         loss_cd_src, z_tgt_src, n_correct, n_word = cross_domain(
             model, tgt_seq_hyp, tgt_pos_hyp, src_seq, src_pos, smoothing)
@@ -221,8 +222,8 @@ def train_epoch(model, discriminator, training_data, optimizer, optimizer_d, opt
 
         loss_auto_tgt, z_tgt_tgt, n_correct, n_word = auto_encoder(
             model, tgt_seq, tgt_pos, smoothing)
-        n_word_total += n_word
-        n_word_correct += n_correct
+        # n_word_total += n_word
+        # n_word_correct += n_correct
 
         loss_cd_tgt, z_src_tgt, n_correct, n_word = cross_domain(
             model, src_seq_hyp, src_pos_hyp, tgt_seq, tgt_pos, smoothing)
@@ -262,6 +263,9 @@ def eval_epoch(model, discriminator, validation_data, opt, device):
     n_word_total = 0
     n_word_correct = 0
 
+    references = []
+    hypotheses = []
+
     with torch.no_grad():
         for batch in tqdm(validation_data, mininterval=2, desc='  - (Validation)  ', leave=False):
             # prepare translator
@@ -274,6 +278,32 @@ def eval_epoch(model, discriminator, validation_data, opt, device):
                 translator, src_seq, src_pos, Constants.BOS_SRC)
             src_seq_hyp, src_pos_hyp = translate(
                 translator, tgt_seq, tgt_pos, Constants.BOS_TGT)
+
+            for i, _ in enumerate(src_seq):
+                # EOSでカット
+                src = src_seq[i, 1:np.where(
+                    src_seq[i] == Constants.EOS)[0][0]]
+                tgt = tgt_seq[i, 1:np.where(
+                    tgt_seq[i] == Constants.EOS)[0][0]]
+                src_hyp = src_seq_hyp[i, 1:np.where(
+                    src_seq_hyp[i] == Constants.EOS)[0][0]]
+                tgt_hyp = tgt_seq_hyp[i, 1:np.where(
+                    tgt_seq_hyp[i] == Constants.EOS)[0][0]]
+
+                # idx2word
+                src = [validation_data.dataset.src_idx2word[idx.item()]
+                       for idx in src]
+                tgt = [validation_data.dataset.tgt_idx2word[idx.item()]
+                       for idx in tgt]
+                src_hyp = [validation_data.dataset.src_idx2word[idx.item()]
+                           for idx in src_hyp]
+                tgt_hyp = [validation_data.dataset.tgt_idx2word[idx.item()]
+                           for idx in tgt_hyp]
+                references.extend([src])
+                references.extend([tgt])
+                hypotheses.extend([src_hyp])
+                hypotheses.extend([tgt_hyp])
+
             tgt_seq_hyp = tgt_seq_hyp.to(device)
             tgt_pos_hyp = tgt_pos_hyp.to(device)
             src_seq_hyp = src_seq_hyp.to(device)
@@ -318,7 +348,10 @@ def eval_epoch(model, discriminator, validation_data, opt, device):
 
     loss_per_word = total_loss/n_word_total
     accuracy = n_word_correct/n_word_total
-    return loss_per_word, accuracy
+    # calc bleu
+    bleu = bleu_score.corpus_bleu(
+        references, hypotheses, smoothing_function=bleu_score.SmoothingFunction().method1)
+    return loss_per_word, accuracy, bleu
 
 
 def train(model, discriminator, training_data, validation_data, optimizer, optimizer_d, device, opt):
@@ -337,6 +370,7 @@ def train(model, discriminator, training_data, validation_data, optimizer, optim
             log_vf.write('epoch, loss, ppl, accuracy\n')
 
     valid_accus = []
+    valid_bleus = []
     for epoch_i in range(opt.epoch):
         print('[ Epoch', epoch_i, ']')
 
@@ -351,17 +385,21 @@ def train(model, discriminator, training_data, validation_data, optimizer, optim
 
         # Evaluate
         start = time.time()
-        valid_loss, valid_accu = eval_epoch(model, discriminator, validation_data, opt, device)
-        print('  - (Validation) ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, '
+        valid_loss, valid_accu, valid_bleu = eval_epoch(
+            model, discriminator, validation_data, opt, device)
+        print('  - (Validation) ppl: {ppl: 8.5f}, accuracy: {accu:3.3f} %, bleu: {valid_bleu:3.3f}, '
               'elapse: {elapse:3.3f} min'.format(
                   ppl=math.exp(min(train_loss, 100)), accu=100*train_accu,
                   elapse=(time.time() - start)/60))
 
         valid_accus += [valid_accu]
+        valid_bleus += [valid_bleu]
 
         model_state_dict = model.state_dict()
+        discriminator_state_dict = discriminator.state_dict()
         checkpoint = {
-            'model': model_state_dict,# discriminatorも追記すべき
+            'model': model_state_dict,
+            'discriminator': discriminator_state_dict,
             'settings': opt,
             'epoch': epoch_i}
 
@@ -372,7 +410,8 @@ def train(model, discriminator, training_data, validation_data, optimizer, optim
                 torch.save(checkpoint, model_name)
             elif opt.save_mode == 'best':
                 model_name = opt.save_model + '.chkpt'
-                if valid_accu >= max(valid_accus):
+                # if valid_accu >= max(valid_accus):
+                if valid_bleu >= max(valid_bleus):
                     torch.save(checkpoint, model_name)
                     print('  - [INFO] The checkpoint file has been updated.')
 
@@ -381,9 +420,9 @@ def train(model, discriminator, training_data, validation_data, optimizer, optim
                 log_tf.write('{epoch}, {loss: 8.5f}, {ppl: 8.5f}, {accu:3.3f}\n'.format(
                     epoch=epoch_i, loss=train_loss,
                     ppl=math.exp(min(train_loss, 100)), accu=100*train_accu))
-                log_vf.write('{epoch}, {loss: 8.5f}, {ppl: 8.5f}, {accu:3.3f}\n'.format(
+                log_vf.write('{epoch}, {loss: 8.5f}, {ppl: 8.5f}, {accu:3.3f}, {bleu:3.3f}\n'.format(
                     epoch=epoch_i, loss=valid_loss,
-                    ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu))
+                    ppl=math.exp(min(valid_loss, 100)), accu=100*valid_accu, bleu=valid_bleu))
 
 
 def main():
@@ -391,7 +430,7 @@ def main():
 
     parser.add_argument('-data', default='./data/preprocessedData')
 
-    parser.add_argument('-epoch', type=int, default=10)
+    parser.add_argument('-epoch', type=int, default=50)
     parser.add_argument('-batch_size', type=int, default=64)
 
     parser.add_argument('-d_model', type=int, default=512)

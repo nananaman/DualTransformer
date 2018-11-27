@@ -1,5 +1,6 @@
 __pycache__/
 data/
+transformer/__pycache__/
 log.train.log
 log.valid.log
 pred.txt

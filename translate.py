@@ -1,15 +1,18 @@
 ''' Translate input text with trained model. '''
 
+import argparse
 import numpy as np
 import torch
 import torch.utils.data
-import argparse
 from tqdm import tqdm
+from nltk.translate import bleu_score
 
 from dataset import collate_fn, TranslationDataset
 from transformer.Translator import Translator
 from preprocess import read_instances_from_file, convert_instance_to_idx_seq
 from transformer.Models import Transformer
+import transformer.Constants as Constants
+from train import translate, prepare_dataloaders
 
 
 def main():
@@ -39,29 +42,14 @@ def main():
     opt.cuda = not opt.no_cuda
     output = opt.output
 
+    # Loading Dataset
+    data = torch.load(opt.vocab)
+    opt.max_token_seq_len = data['settings'].max_token_seq_len
 
-    # Prepare DataLoader
-    preprocess_data = torch.load(opt.vocab)
-    preprocess_settings = preprocess_data['settings']
-    test_src_word_insts, test_tgt_word_insts = read_instances_from_file(
-        opt.src,
-        preprocess_settings.max_word_seq_len)
-    # validで仮置き
-    train_src_word_insts, test_src_word_insts = np.split(test_src_word_insts, [int(
-        len(test_src_word_insts) * preprocess_settings.train_valid_ratio)])
-    test_src_insts = convert_instance_to_idx_seq(
-        test_src_word_insts, preprocess_data['dict']['src'])
+    training_data, validation_data = prepare_dataloaders(data, opt)
+    test_loader = validation_data
+    # test_loader = training_data
 
-    test_loader = torch.utils.data.DataLoader(
-        TranslationDataset(
-            src_word2idx=preprocess_data['dict']['src'],
-            tgt_word2idx=preprocess_data['dict']['tgt'],
-            src_insts=test_src_insts),
-        num_workers=2,
-        batch_size=opt.batch_size,
-        collate_fn=collate_fn)
-
-    ##########
     checkpoint = torch.load(opt.model)
     opt = checkpoint['settings']
     model = Transformer(
@@ -84,18 +72,63 @@ def main():
         checkpoint['model'][key[7:]] = checkpoint['model'].pop(key)
     model.load_state_dict(checkpoint['model'])
     model = model.to(device)
-    ##########
 
     translator = Translator(opt, model)
 
+    references = []
+    hypotheses = []
+
     with open(output, 'w') as f:
         for batch in tqdm(test_loader, mininterval=2, desc='  - (Test)', leave=False):
-            all_hyp, all_scores = translator.translate_batch(*batch)
-            for idx_seqs in all_hyp:
-                for idx_seq in idx_seqs:
-                    pred_line = ' '.join(
-                        [test_loader.dataset.tgt_idx2word[idx] for idx in idx_seq])
-                    f.write(pred_line + '\n')
+            # prepare data
+            src_seq, src_pos, tgt_seq, tgt_pos = map(
+                lambda x: x.to(device), batch)
+            tgt_seq_hyp, _ = translate(
+                translator, src_seq, src_pos, Constants.BOS_SRC)
+            src_seq_hyp, _ = translate(
+                translator, tgt_seq, tgt_pos, Constants.BOS_TGT)
+
+            for i in range(len(src_seq)):
+                # EOSでカット
+                src = src_seq[i, 1:np.where(
+                    src_seq[i] == Constants.EOS)[0][0]]
+                tgt = tgt_seq[i, 1:np.where(
+                    tgt_seq[i] == Constants.EOS)[0][0]]
+                src_hyp = src_seq_hyp[i, 1:np.where(
+                    src_seq_hyp[i] == Constants.EOS)[0][0]]
+                tgt_hyp = tgt_seq_hyp[i, 1:np.where(
+                    tgt_seq_hyp[i] == Constants.EOS)[0][0]]
+                
+                # idx2word
+                src = [test_loader.dataset.src_idx2word[idx.item()]
+                       for idx in src]
+                tgt = [test_loader.dataset.tgt_idx2word[idx.item()]
+                       for idx in tgt]
+                src_hyp = [test_loader.dataset.src_idx2word[idx.item()]
+                           for idx in src_hyp]
+                tgt_hyp = [test_loader.dataset.tgt_idx2word[idx.item()]
+                           for idx in tgt_hyp]
+                src_line = 'src    : ' + ''.join(src)
+                tgt_line = 'tgt    : ' + ''.join(tgt)
+                src_hyp_line = 'src_hyp: ' + ''.join(src_hyp)
+                tgt_hyp_line = 'tgt_hyp: ' + ''.join(tgt_hyp)
+                pred_line = src_line + '\n' + tgt_line + '\n' + \
+                    src_hyp_line + '\n' + tgt_hyp_line + '\n\n'
+                f.write(pred_line)
+
+                references.extend([src])
+                references.extend([tgt])
+                hypotheses.extend([src_hyp])
+                hypotheses.extend([tgt_hyp])
+
+                if i > 20:
+                    break
+            break
+
+    # calc bleu
+    bleu = bleu_score.corpus_bleu(
+            references, hypotheses, smoothing_function=bleu_score.SmoothingFunction().method1)
+    print('[Info] BLEU : {}'.format(bleu))
     print('[Info] Finished.')
 
 
